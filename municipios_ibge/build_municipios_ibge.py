@@ -35,9 +35,10 @@
                                   UFs, Resumo_UF, Auditoria_Coordenadas,
                                   Validacao, Fontes)
    build_log.txt                 (log completo da execução)
-   Se alguma validação crítica falhar, o arquivo é gravado como
-   Municipios_Brasil_IBGE_FALHOU.xlsx (para diagnóstico), o entregável anterior
-   NÃO é sobrescrito e o script termina com exit code 1.
+   Se alguma validação crítica falhar, o resultado vai para
+   Municipios_Brasil_IBGE_FALHOU.xlsx + build_log_FALHOU.txt (diagnóstico), o
+   entregável anterior e seu build_log.txt NÃO são sobrescritos e o script
+   termina com exit code 1. Um build bem-sucedido remove diagnósticos antigos.
 
  PRÉ-REQUISITOS
    Python >= 3.10 | pandas >= 2.0 | openpyxl >= 3.1 | shapely >= 2.0 | numpy
@@ -120,7 +121,7 @@ LIMIAR_DIVERGENCIA_KM = 5.0          # 2022 é tido como erro se divergir > X km
 LIMIAR_DIVERGENCIA_CAPITAL_KM = 10.0 # capitais: área urbana extensa, pontos representativos divergem mais
 RAIO_LOCALIDADE_KM = 1.5             # evidência: ponto 2022 "grudado" em outra localidade (povoado, vila...)
 RAIO_ISOLADO_KM = 10.0               # evidência: ponto 2022 sem nenhuma localidade 2010 num raio de X km
-FAIXA_REVISAO_KM = (3.0, 5.0)        # divergência moderada: anotada e auditada, ponto mantido
+FAIXA_REVISAO_KM = (3.0, 5.0)        # ponto 2022 mantido a >= 3 km das DUAS referências: anotado e auditado
 CONCORDANCIA_REF_KM = 2.5            # IBGE 2010 e base independente "concordam" se a menos de X km
 RAIO_VILA_PROXIMA_KM = 0.5           # sede a < X km da sede de OUTRO distrito do município: anotar
 MAX_MINUTO_PARA_2010_KM = 3.0        # ponto 2022 arredondado ao minuto: usar 2010 se a menos de X km
@@ -129,7 +130,8 @@ LIMIAR_AUDITORIA_KM = 5.0            # linhas com qualquer divergência > X km v
 
 # --- Coordenada da sede distrital ---
 LIMIAR_VILAS_DIVERGENTES_KM = 3.0    # Vila 2022 x Vila 2010 divergentes
-RAIO_HOMONIMO_KM = 1.0               # localidade 2022 homônima perto do ponto 2010 confirma o ponto 2010
+RAIO_HOMONIMO_KM = 1.0               # localidade 2022 com o nome do distrito perto do ponto 2010 confirma o ponto 2010
+RAIO_VILA_ISOLADA_KM = 5.0           # Vila 2022 sem outra localidade 2022 num raio de X km = suspeita de geocodificação
 LIMIAR_NOME_PARECIDO = 0.6           # difflib ratio: >= é variação de grafia; < é outra localidade
 
 # --- Centroide ---
@@ -162,7 +164,6 @@ CURADORIA = {
     "3541000": {  # Praia Grande/SP
         "status": "Corrigida",
         "ref": (-24.0058, -46.4028, "geodatos.net / Cidade Brasil (centro)"),
-        "nota": "Referência externa de centro confirma o ponto IBGE 2010.",
     },
     "2107506": {  # Paço do Lumiar/MA
         "status": "Corrigida",
@@ -323,6 +324,7 @@ ROTULO_FONTE = {
     "nenhuma": "Sem ponto oficial de sede distrital",
 }
 SUFIXO_NOME_DIFERENTE = " — localidade com outro nome na fonte, a conferir"
+SUFIXO_VILAS_DIVERGENTES = " — Vila 2010 diverge, a conferir"
 CATEGORIA_2010 = {"AUI": "Aglomerado Urbano Isolado", "POVOADO": "Povoado", "NÚCLEO": "Núcleo", "LUGAREJO": "Lugarejo",
                   "ALDEIA INDÍGENA": "Aldeia Indígena", "PROJETO DE ASSENTAMENTO": "Projeto de Assentamento"}
 
@@ -332,13 +334,25 @@ log = logging.getLogger("build")
 # =============================================================================
 # 2. FUNÇÕES — utilitários
 # =============================================================================
+LOG_TMP, LOG_OK, LOG_FALHA = ".build_log_tmp.txt", "build_log.txt", "build_log_FALHOU.txt"
+
+
 def configurar_log(saida: Path) -> None:
+    """Log vai para um arquivo temporário; só vira build_log.txt se o build passar (ver finalizar_log)."""
     fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", "%H:%M:%S")
     log.setLevel(logging.INFO)
     log.handlers.clear()
-    for h in (logging.StreamHandler(sys.stdout), logging.FileHandler(saida / "build_log.txt", "w", "utf-8")):
+    for h in (logging.StreamHandler(sys.stdout), logging.FileHandler(saida / LOG_TMP, "w", "utf-8")):
         h.setFormatter(fmt)
         log.addHandler(h)
+
+
+def finalizar_log(saida: Path, sucesso: bool) -> None:
+    for h in list(log.handlers):
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            log.removeHandler(h)
+    os.replace(saida / LOG_TMP, saida / (LOG_OK if sucesso else LOG_FALHA))
 
 
 def sha256(path: Path) -> str:
@@ -360,8 +374,39 @@ def norm_nome(s) -> str:
     return re.sub(r"[^a-z0-9]", "", s)
 
 
+def norm_fonetico(s) -> str:
+    """Normalização fonética leve do português para comparar grafias (Chonim ~ Xonin, Tuiutí ~ Tuiuty)."""
+    s = norm_nome(s)
+    for a, b in (("ch", "x"), ("ph", "f"), ("th", "t"), ("y", "i"), ("w", "v"), ("ss", "s"), ("z", "s")):
+        s = s.replace(a, b)
+    s = re.sub(r"(.)\1+", r"\1", s)  # letras dobradas
+    return re.sub(r"m$", "n", s)
+
+
 def parecido(a, b) -> float:
-    return difflib.SequenceMatcher(None, norm_nome(a), norm_nome(b)).ratio()
+    return difflib.SequenceMatcher(None, norm_fonetico(a), norm_fonetico(b)).ratio()
+
+
+_MINUSCULAS_PT = {"da", "de", "do", "das", "dos", "e", "d"}
+_SIGLAS = {"PA", "AUI", "BR", "KM"}
+
+
+def titulo_pt(s) -> str:
+    """Title case do português: preposições em minúsculo, siglas preservadas ('Agrovila do PA Santo Antonio')."""
+    saida = []
+    for i, tok in enumerate(str(s).split()):
+        if tok.upper() in _SIGLAS:
+            saida.append(tok.upper())
+        elif i > 0 and tok.lower() in _MINUSCULAS_PT:
+            saida.append(tok.lower())
+        else:
+            saida.append(tok[:1].upper() + tok[1:].lower())
+    return " ".join(saida)
+
+
+def br_coord(lat, lon) -> str:
+    """Coordenada em texto PT-BR: '(-9,6462; -63,9599)'."""
+    return f"({br_num(lat, 4)}; {br_num(lon, 4)})"
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -412,6 +457,24 @@ def arredondado_ao_minuto(x: float) -> bool:
 # =============================================================================
 # 3. FUNÇÕES — leitores de fontes (parsers puros; nada é executado)
 # =============================================================================
+def _texto_odf(no, ns) -> str:
+    """Texto de um <text:p> expandindo <text:s c=n/> (espaços), <text:tab/> e <text:line-break/>,
+    para que espaços duplicados/iniciais da fonte não sejam colapsados em silêncio."""
+    TX = "{%s}" % ns["text"]
+    partes = [no.text or ""]
+    for filho in no:
+        if filho.tag == TX + "s":
+            partes.append(" " * int(filho.get(TX + "c", "1")))
+        elif filho.tag == TX + "tab":
+            partes.append("\t")
+        elif filho.tag == TX + "line-break":
+            partes.append("\n")
+        else:
+            partes.append(_texto_odf(filho, ns))
+        partes.append(filho.tail or "")
+    return "".join(partes)
+
+
 def ler_ods(path: Path) -> list[list[str]]:
     """Lê a 1ª planilha de um .ods (stdlib), expandindo células repetidas."""
     ns = {"table": "urn:oasis:names:tc:opendocument:xmlns:table:1.0",
@@ -426,7 +489,7 @@ def ler_ods(path: Path) -> list[list[str]]:
             if tc.tag not in (T + "table-cell", T + "covered-table-cell"):
                 continue
             rep = int(tc.get(T + "number-columns-repeated", "1"))
-            txt = "\n".join("".join(p.itertext()) for p in tc.findall("text:p", ns))
+            txt = "\n".join(_texto_odf(p, ns) for p in tc.findall("text:p", ns))
             vals.extend([txt] * min(rep, 64))  # repetição longa = células vazias de cauda
         while vals and vals[-1] == "":
             vals.pop()
@@ -640,15 +703,20 @@ def derivar_pontos_malha(geoms: dict) -> tuple[pd.DataFrame, list]:
     Partes a mais de DISTANCIA_PARTES_CENTROIDE_KM da maior parte (ilhas oceânicas) ficam fora do centroide."""
     regs, com_ilhas = [], []
     for cod, g in geoms.items():
-        maior_geo = max(g.geoms, key=lambda q: q.area) if g.geom_type == "MultiPolygon" else g
-        c0 = maior_geo.centroid
-        fwd, inv = _laea(c0.x, c0.y)
+        fwd, inv = _laea(g.centroid.x, g.centroid.y)
         gp = shapely.transform(g, fwd)
         partes = list(gp.geoms) if gp.geom_type == "MultiPolygon" else [gp]
         maior = max(partes, key=lambda q: q.area)
         perto = [q for q in partes if q.distance(maior) <= DISTANCIA_PARTES_CENTROIDE_KM]
         if len(perto) < len(partes):
+            # ilhas distantes: reprojeta centrado na maior parte (o centro anterior pode estar no oceano)
             com_ilhas.append(cod)
+            maior_geo = max(g.geoms, key=lambda q: q.area)
+            fwd, inv = _laea(maior_geo.centroid.x, maior_geo.centroid.y)
+            gp = shapely.transform(g, fwd)
+            partes = list(gp.geoms)
+            maior = max(partes, key=lambda q: q.area)
+            perto = [q for q in partes if q.distance(maior) <= DISTANCIA_PARTES_CENTROIDE_KM]
         base = shapely.union_all(perto) if len(perto) > 1 else maior
         cx, cy = inv(base.centroid.x, base.centroid.y)
         pl = polylabel(maior, tolerance=0.01)  # 10 m
@@ -723,7 +791,7 @@ def escolher_coordenada_sede(row, limiar: float) -> tuple[float, float, str, str
         return np.nan, np.nan, "", "Sem coordenada", "Nenhuma fonte oficial"
     tem10, temk = pd.notna(d_22_10), pd.notna(d_22_k)
     if tem10 and temk and d_22_10 > limiar and d_22_k > limiar:
-        obs = (f"Ponto IBGE 2022 ({row['lat_2022']:.4f}; {row['lon_2022']:.4f}) divergia {br_num(d_22_10)} km do "
+        obs = (f"Ponto IBGE 2022 {br_coord(row['lat_2022'], row['lon_2022'])} divergia {br_num(d_22_10)} km do "
                f"IBGE 2010 e {br_num(d_22_k)} km da base independente; substituído pelo IBGE 2010")
         return row["lat_2010"], row["lon_2010"], "2010", "Corrigida", obs
     if tem10 != temk:
@@ -736,7 +804,13 @@ def escolher_coordenada_sede(row, limiar: float) -> tuple[float, float, str, str
 
 
 def juntar_obs(*partes) -> str:
-    return "; ".join(p for p in partes if isinstance(p, str) and p)
+    """Junta trechos como frases: sem pontuação dupla, cada trecho iniciando em maiúscula, ponto final."""
+    frases = []
+    for p in partes:
+        if isinstance(p, str) and p.strip():
+            p = p.strip().rstrip(".;")
+            frases.append(p[:1].upper() + p[1:])
+    return ". ".join(frases) + "." if frases else ""
 
 
 # =============================================================================
@@ -800,10 +874,13 @@ def escrever_tabela(ws, df: pd.DataFrame, nome_tabela: str, larguras: dict, form
         if comentarios and col in comentarios:
             hc.comment = Comment(comentarios[col], AUTOR_COMENTARIO, width=320, height=140)
         fmt = formatos.get(col)
+        centro = Alignment(horizontal="center") if fmt == FMT_INT else None
         for (c,) in ws.iter_rows(min_row=2, max_row=n_lin, min_col=j, max_col=j):
             c.font = FONTE_DADOS
             if fmt:
                 c.number_format = fmt
+            if centro:
+                c.alignment = centro
     ws.row_dimensions[1].height = 42
     ws.freeze_panes = freeze
     return n_lin
@@ -937,6 +1014,7 @@ def main(argv=None) -> int:
 
     # ---------- 7.2 Normalização de texto (defeito de codificação no próprio IBGE) ----------
     nomes_corrigidos = {}
+    dtb_bruto = dtb[["cod_rgi", "nome_rgi", "cod_rgint", "nome_rgint"]].copy()
     for col in ("nome_rgi", "nome_rgint"):
         for v in dtb[col].unique():
             nv = normalizar_texto(v)
@@ -1023,6 +1101,10 @@ def main(argv=None) -> int:
     dist["distrito_sede"] = np.where(dist["cod_mun"].isin(sem_sede_codificada), "Não se aplica",
                                      np.where(dist["sufixo"] == 5, "Sim", "Não"))
     log.info("Municípios sem distrito-sede codificado (sufixos 01-04 em uso): %s", sorted(sem_sede_codificada))
+    txt_sem_sede = ", ".join(
+        f"{nome_mun[c]}/{uf_mun[c]} ({int((dist['cod_mun'] == c).sum())} distritos numerados "
+        f"{dist.loc[dist['cod_mun'] == c, 'sufixo'].min():02d}–{dist.loc[dist['cod_mun'] == c, 'sufixo'].max():02d})"
+        for c in sorted(sem_sede_codificada)) or "nenhum município"
     V.checar("Distritos", "Municípios com exatamente 1 distrito-sede (sufixo 05), exceto sem sede codificada",
              len(mun) - len(sem_sede_codificada),
              int(dist[dist["distrito_sede"] == "Sim"].groupby("cod_mun").size().eq(1).sum()))
@@ -1070,7 +1152,7 @@ def main(argv=None) -> int:
         excl = ((loc10["cod_mun"] == cod) & (loc10["categoria"] == "CIDADE")).to_numpy()
         viz, d = ilocal.mais_proxima(s.at[i, "lat_2022"], s.at[i, "lon_2022"], excl)
         if d <= RAIO_LOCALIDADE_KM:
-            ev = (f"o ponto 2022 coincide com {CATEGORIA_2010.get(viz['categoria'], viz['categoria'].title())} '{viz['nome'].title()}' "
+            ev = (f"o ponto 2022 coincide com {CATEGORIA_2010.get(viz['categoria'], viz['categoria'].title())} '{titulo_pt(viz['nome'])}' "
                   f"(IBGE 2010, a {br_num(d, 2)} km)")
         elif d > RAIO_ISOLADO_KM:
             ev = f"o ponto 2022 está isolado (localidade IBGE 2010 mais próxima a {br_num(d)} km)"
@@ -1090,18 +1172,23 @@ def main(argv=None) -> int:
             s.at[i, "fonte_chave"] = "2010"
             s.at[i, "status_coord"] = "Corrigida"
             s.at[i, "obs_coord"] = juntar_obs(s.at[i, "obs_coord"], (
-                f"Ponto IBGE 2022 ({s.at[i, 'lat_2022']:.4f}; {s.at[i, 'lon_2022']:.4f}) arredondado ao minuto de arco; "
+                f"Ponto IBGE 2022 {br_coord(s.at[i, 'lat_2022'], s.at[i, 'lon_2022'])} arredondado ao minuto de arco; "
                 f"usado o ponto IBGE 2010, de precisão total, a {br_num(s.at[i, 'km_2022_2010'], 2)} km"))
 
-    # Divergência moderada (3-5 km) com IBGE 2010 e base independente concordando entre si: anotar
-    lo, hi = FAIXA_REVISAO_KM
-    mod = ((s["fonte_chave"] == "2022") & s["km_2022_2010"].between(lo, hi) & s["km_2022_kelvins"].between(lo, hi)
+    # Ponto 2022 mantido, mas a >= 3 km das DUAS referências, que concordam entre si: anotar (sem mover)
+    lo = FAIXA_REVISAO_KM[0]
+    mod = ((s["fonte_chave"] == "2022") & (s["km_2022_2010"] >= lo) & (s["km_2022_kelvins"] >= lo)
            & (s["km_2010_kelvins"] <= CONCORDANCIA_REF_KM))
     for i in s.index[mod]:
+        capital = ""
+        if min(s.at[i, "km_2022_2010"], s.at[i, "km_2022_kelvins"]) > LIMIAR_DIVERGENCIA_KM:
+            capital = f" (capital: o ponto só é substituído acima de {br_num(LIMIAR_DIVERGENCIA_CAPITAL_KM, 0)} km)"
         s.at[i, "obs_coord"] = juntar_obs(s.at[i, "obs_coord"], (
-            f"Divergência moderada: IBGE 2010 ({s.at[i, 'lat_2010']:.4f}; {s.at[i, 'lon_2010']:.4f}) e base "
-            f"independente concordam entre si e ficam a {br_num(s.at[i, 'km_2022_2010'])} km do ponto IBGE 2022 mantido"))
+            f"Ponto IBGE 2022 mantido{capital}, mas o IBGE 2010 {br_coord(s.at[i, 'lat_2010'], s.at[i, 'lon_2010'])} "
+            f"fica a {br_num(s.at[i, 'km_2022_2010'])} km e a base independente a {br_num(s.at[i, 'km_2022_kelvins'])} km "
+            f"dele; entre si, as duas referências distam {br_num(s.at[i, 'km_2010_kelvins'])} km"))
     s["divergencia_moderada"] = mod
+    s["minuto"] = s["obs_coord"].str.contains("arredondado ao minuto", na=False)
     s["lat"] = s["lat"].astype(float).round(6)
     s["lon"] = s["lon"].astype(float).round(6)
     s["fonte_coord"] = s["fonte_chave"].map(ROTULO_FONTE)
@@ -1120,8 +1207,7 @@ def main(argv=None) -> int:
         if "ref" in cur:
             rlat, rlon, rnome = cur["ref"]
             d = float(haversine_km(s.at[i, "lat"], s.at[i, "lon"], rlat, rlon))
-            partes.append(f"Referência externa — {rnome}: ({br_num(rlat, 4)}; {br_num(rlon, 4)}), a {br_num(d)} km "
-                          "do ponto adotado")
+            partes.append(f"Referência externa — {rnome}: {br_coord(rlat, rlon)}, a {br_num(d)} km do ponto adotado")
         if "status" in cur:
             s.at[i, "status_coord"] = cur["status"]
         s.at[i, "obs_coord"] = juntar_obs(s.at[i, "obs_coord"], *partes)
@@ -1151,7 +1237,7 @@ def main(argv=None) -> int:
              br_pct(s["dentro_poligono"].mean(), 2), ok=s["dentro_poligono"].mean() >= 0.995, critico=False)
     V.checar("Coordenadas", "Pontos IBGE 2022 substituídos pelo IBGE 2010", "informativo",
              int((s["fonte_chave"] == "2010").sum()), ok=True, critico=False)
-    V.checar("Coordenadas", "Pontos mantidos com divergência moderada (3-5 km) anotada", "informativo",
+    V.checar("Coordenadas", "Pontos IBGE 2022 mantidos a ≥ 3 km das duas referências (anotados)", "informativo",
              int(mod.sum()), ok=True, critico=False)
     d_final_k = haversine_km(s["lat"], s["lon"], s["lat_k"], s["lon_k"])
     V.checar("Coordenadas", "Mediana da distância final x base independente (km)", "< 1",
@@ -1183,13 +1269,14 @@ def main(argv=None) -> int:
         return unicos.set_index("chave")
     hom22 = homonimos(loc22, "categoria", {"Cidade", "Vila"})
     hom10 = homonimos(loc10, "categoria", {"CIDADE", "VILA"})
-    loc22_nome = loc22.assign(n=loc22["nome"].map(norm_nome))
+    loc22_nome = loc22.assign(n=loc22["nome"].map(norm_nome)).reset_index(drop=True)
+    loc22_xy = loc22_nome[["lat", "lon"]].to_numpy()
 
     eh_sede = dist["distrito_sede"] == "Sim"
     escolhas, rejeitados, n_vila_corr = [], [], 0
     for cod_d, cod_m, nome_d, sede_flag in zip(dist["cod_distrito"], dist["cod_mun"], dist["distrito"], eh_sede):
         if sede_flag:
-            escolhas.append((np.nan, np.nan, None, None, "", ""))
+            escolhas.append((np.nan, np.nan, None, None, "", "", ""))
             continue
         chave_h = cod_m + "|" + norm_nome(nome_d)
         cands = []
@@ -1206,22 +1293,25 @@ def main(argv=None) -> int:
             r = hom10.loc[chave_h]
             cands.append(("hom2010", r["lat"], r["lon"], r["nome"], CATEGORIA_2010.get(r["categoria"], r["categoria"].title())))
         obs = []
-        # Vila 2022 x Vila 2010 muito distantes: a 2010 vence se uma localidade 2022 homônima a confirma
+        # Vila 2022 x Vila 2010 muito distantes: a 2010 vence só se (a) uma localidade 2022 cujo nome contém o
+        # nome do distrito está a <= 1 km do ponto 2010 E (b) a Vila 2022 está isolada (nenhuma outra localidade
+        # 2022 a < 5 km — sinal de geocodificação errada, como em Pinhel/PA). Senão mantém 2022 e marca 'a conferir'.
+        d_vv, trocou, corrob = None, False, None
         if len(cands) >= 2 and cands[0][0] == "vila2022" and cands[1][0] == "vila2010":
+            c22, c10_ = cands[0], cands[1]
             d_vv = float(haversine_km(cands[0][1], cands[0][2], cands[1][1], cands[1][2]))
             if d_vv > LIMIAR_VILAS_DIVERGENTES_KM:
+                nd = norm_nome(nome_d)
                 l22 = loc22_nome[(loc22_nome["cod_mun"] == cod_m) & (loc22_nome["categoria"] != "Vila")
-                                 & (loc22_nome["n"] == norm_nome(nome_d))]
-                d_hom = haversine_km(l22["lat"], l22["lon"], cands[1][1], cands[1][2]) if len(l22) else np.array([])
-                if len(d_hom) and float(np.min(d_hom)) <= RAIO_HOMONIMO_KM:
+                                 & loc22_nome["n"].str.contains(nd, regex=False)]
+                d_hom = haversine_km(l22["lat"].to_numpy(), l22["lon"].to_numpy(), cands[1][1], cands[1][2])
+                outros = loc22_xy[loc22_nome["cod_localidade"].to_numpy() != cod_d]
+                d_iso = float(np.min(haversine_km(outros[:, 0], outros[:, 1], cands[0][1], cands[0][2])))
+                if len(d_hom) and float(np.min(d_hom)) <= RAIO_HOMONIMO_KM and d_iso > RAIO_VILA_ISOLADA_KM:
                     j = int(np.argmin(d_hom))
-                    obs.append(f"Vila IBGE 2022 ({cands[0][1]:.4f}; {cands[0][2]:.4f}) a {br_num(d_vv)} km da Vila 2010; "
-                               f"a localidade 2022 homônima ({l22.iloc[j]['categoria']}) confirma o ponto 2010")
+                    corrob = (l22.iloc[j]["nome"], l22.iloc[j]["categoria"], float(d_hom[j]), d_iso)
                     cands[0], cands[1] = cands[1], cands[0]
-                    n_vila_corr += 1
-                else:
-                    obs.append(f"Vila IBGE 2022 e Vila IBGE 2010 ({cands[1][1]:.4f}; {cands[1][2]:.4f}) divergem "
-                               f"{br_num(d_vv)} km; mantido o ponto 2022")
+                    trocou = True
         achou = None
         for chave, la, lo_, nome_f, cat in cands:
             t = idx.testar(cod_m, la, lo_)
@@ -1229,21 +1319,40 @@ def main(argv=None) -> int:
                 achou = (la, lo_, chave, nome_f, cat)
                 break
             rejeitados.append((cod_d, nome_d, chave, la, lo_))
-            obs.append(f"Ponto {ROTULO_FONTE[chave]} ({la:.4f}; {lo_:.4f}) descartado: caía {br_num(t.dist_km)} km "
+            obs.append(f"Ponto {ROTULO_FONTE[chave]} {br_coord(la, lo_)} descartado: caía {br_num(t.dist_km)} km "
                        f"fora do município (em {nome_mun.get(t.cai_em, 'área sem município')})")
+        flag = ""
+        if d_vv is not None and d_vv > LIMIAR_VILAS_DIVERGENTES_KM and achou:
+            if trocou and achou[2] == "vila2010":
+                obs.insert(0, f"Vila IBGE 2022 {br_coord(c22[1], c22[2])} isolada (outra localidade 2022 mais "
+                              f"próxima a {br_num(corrob[3])} km) e a {br_num(d_vv)} km da Vila 2010; a localidade 2022 "
+                              f"'{titulo_pt(corrob[0])}' ({corrob[1]}), a {br_num(corrob[2], 2)} km, confirma o ponto 2010")
+                n_vila_corr += 1
+            elif achou[2] == "vila2022":
+                obs.insert(0, f"A Vila IBGE 2010 {br_coord(c10_[1], c10_[2])} fica a {br_num(d_vv)} km; mantido o "
+                              "ponto 2022")
+                flag = SUFIXO_VILAS_DIVERGENTES
         if achou:
-            escolhas.append((achou[0], achou[1], achou[2], achou[3], juntar_obs(*obs), achou[4]))
+            escolhas.append((achou[0], achou[1], achou[2], achou[3], juntar_obs(*obs), achou[4], flag))
         else:
-            escolhas.append((np.nan, np.nan, "nenhuma", None, juntar_obs(*obs), ""))
-    esc = pd.DataFrame(escolhas, columns=["lat", "lon", "fonte", "nome_fonte", "obs_dist", "cat_hom"], index=dist.index)
+            escolhas.append((np.nan, np.nan, "nenhuma", None, juntar_obs(*obs), "", ""))
+    esc = pd.DataFrame(escolhas, columns=["lat", "lon", "fonte", "nome_fonte", "obs_dist", "cat_hom", "flag_vv"],
+                       index=dist.index)
     dist = pd.concat([dist, esc], axis=1)
-    log.info("Distritos: pontos reprovados no teste de polígono = %d %s | Vila 2010 preferida à 2022 = %d",
-             len(rejeitados), [r[:3] for r in rejeitados], n_vila_corr)
+    log.info("Distritos: pontos reprovados no teste de polígono = %d %s | Vila 2010 preferida à 2022 = %d | "
+             "Vila 2022 mantida com Vila 2010 divergente = %d", len(rejeitados), [r[:3] for r in rejeitados],
+             n_vila_corr, int((dist["flag_vv"] != "").sum()))
     dist.loc[eh_sede, ["lat", "lon"]] = dist.loc[eh_sede, ["lat_mun", "lon_mun"]].values
     dist["fonte_dist"] = np.where(eh_sede, dist["fonte_mun"] + " — sede municipal", dist["fonte"].map(ROTULO_FONTE))
     hom = dist["fonte"].isin(["hom2022", "hom2010"])
     dist.loc[hom, "fonte_dist"] = [f"IBGE Localidades {f[-4:]} (localidade homônima: {c})"
                                    for f, c in zip(dist.loc[hom, "fonte"], dist.loc[hom, "cat_hom"])]
+    dist["fonte_dist"] = dist["fonte_dist"] + dist["flag_vv"].fillna("")
+    # Distrito-sede herda o 'a conferir' da sede municipal
+    status_mun = dict(zip(s["cod_mun"], s["status_coord"]))
+    sede_conf = eh_sede & dist["cod_mun"].map(lambda c: "conferir" in status_mun.get(c, ""))
+    dist.loc[sede_conf, "fonte_dist"] = dist.loc[sede_conf, "fonte_dist"] + " — a conferir"
+    dist.loc[sede_conf, "obs_dist"] = "Sede municipal marcada 'a conferir' — ver a observação na aba Municipios."
     # Nome do ponto x nome do distrito: grafia (anota) ou outra localidade (anota + qualifica a fonte)
     tem_vila = dist["fonte"].isin(["vila2022", "vila2010"]) & dist["lat"].notna()
     for i in dist.index[tem_vila]:
@@ -1251,9 +1360,9 @@ def main(argv=None) -> int:
         if norm_nome(nf) == norm_nome(nd):
             continue
         if parecido(nf, nd) >= LIMIAR_NOME_PARECIDO:
-            dist.at[i, "obs_dist"] = juntar_obs(dist.at[i, "obs_dist"], f"Grafia na fonte do ponto: {str(nf).title()}")
+            dist.at[i, "obs_dist"] = juntar_obs(dist.at[i, "obs_dist"], f"Grafia na fonte do ponto: {titulo_pt(nf)}")
         else:
-            dist.at[i, "obs_dist"] = juntar_obs(dist.at[i, "obs_dist"], f"Nome do ponto na fonte: {str(nf).title()}")
+            dist.at[i, "obs_dist"] = juntar_obs(dist.at[i, "obs_dist"], f"Nome do ponto na fonte: {titulo_pt(nf)}")
             dist.at[i, "fonte_dist"] = dist.at[i, "fonte_dist"] + SUFIXO_NOME_DIFERENTE
     # Motivo explícito para cada distrito sem coordenada
     codigos10 = set(loc10["cod_distrito"])
@@ -1270,7 +1379,8 @@ def main(argv=None) -> int:
         elif cod_d in codigos10:
             m = "Distrito já existia em 2010, mas sem ponto 'Vila' no cadastro IBGE 2010"
         else:
-            m = "Distrito criado após 2010; ponto IBGE 2022 desta UF não disponível no espelho usado"
+            m = ("Distrito criado após 2010 (sem ponto IBGE 2022 nos arquivos disponíveis, que cobrem só "
+                 "GO, SC, AM, AP, PA e RR)")
         motivos[m] += 1
         dist.at[i, "obs_dist"] = juntar_obs(m, dist.at[i, "obs_dist"])
     dist["lat"] = dist["lat"].astype(float).round(6)
@@ -1281,9 +1391,11 @@ def main(argv=None) -> int:
     sede_proxima_vila = {}
     nao_sede_pt = dist[(~eh_sede) & dist["lat"].notna()]
     d_ns = haversine_km(nao_sede_pt["lat"], nao_sede_pt["lon"], nao_sede_pt["lat_mun"], nao_sede_pt["lon_mun"])
-    for (_, r), d in zip(nao_sede_pt.iterrows(), d_ns):
+    for (i_d, r), d in zip(nao_sede_pt.iterrows(), d_ns):
         if d <= RAIO_VILA_PROXIMA_KM and r["cod_mun"] not in sem_sede_codificada:
             sede_proxima_vila[r["cod_mun"]] = (r["distrito"], float(d))
+            dist.at[i_d, "obs_dist"] = juntar_obs(dist.at[i_d, "obs_dist"], (
+                f"Ponto a {br_num(float(d), 2)} km da sede municipal (a sede municipal pode estar neste distrito)"))
     for cod, (nd, d) in sede_proxima_vila.items():
         i = s.index[s["cod_mun"] == cod][0]
         s.at[i, "obs_coord"] = juntar_obs(s.at[i, "obs_coord"], (
@@ -1328,7 +1440,7 @@ def main(argv=None) -> int:
         "Capital (Sim/Não)": M["capital"],
         "Qtd. Distritos": M["qtd"].astype(int),
         "Código Distrito-Sede": M["cod_sede"].map(lambda v: int(v) if pd.notna(v) else None),
-        "Distrito-Sede": M["nome_sede"],
+        "Nome do Distrito-Sede": M["nome_sede"],
         "Distritos": M["lista"],
         "Sede dentro do Limite Municipal": M["sede_no_limite"],
         "Observação da Coordenada": M["obs_coord"].replace("", None),
@@ -1395,8 +1507,9 @@ def main(argv=None) -> int:
     regras = [
         ((s_aud[["km_2022_2010", "km_2022_kelvins", "km_2010_kelvins"]] > LIMIAR_AUDITORIA_KM).any(axis=1),
          f"Divergência > {br_num(LIMIAR_AUDITORIA_KM, 0)} km entre fontes"),
-        (s_aud["divergencia_moderada"], "Divergência moderada (3-5 km)"),
-        (s_aud["status_coord"] != "OK", "Status diferente de OK"),
+        (s_aud["divergencia_moderada"], "Ponto 2022 a ≥ 3 km das duas referências"),
+        (s_aud["minuto"], "Ponto 2022 com precisão de minuto"),
+        ((s_aud["status_coord"] != "OK") & ~s_aud["minuto"], "Status diferente de OK"),
         (s_aud["sede_no_limite"] != "Sim", "Sede na borda/fora do limite"),
         (s_aud["cod_mun"].isin(sede_proxima_vila), "Sede junto à sede de outro distrito"),
         (s_aud["curadoria"] == "Sim", "Curadoria documentada"),
@@ -1406,23 +1519,34 @@ def main(argv=None) -> int:
     aud = s_aud[s_aud["motivo"] != ""].copy()
 
     def decisao(r):
+        """Rótulo fiel ao caso: 'confirma' só quando a referência está a < 3 km do ponto mantido."""
+        d10, dk, d10k = r["km_2022_2010"], r["km_2022_kelvins"], r["km_2010_kelvins"]
+        perto = FAIXA_REVISAO_KM[0]
+        if r["minuto"]:
+            return "Usado IBGE 2010 (ponto 2022 arredondado ao minuto de arco)"
         if r["fonte_chave"] == "2010":
-            return "Usado IBGE 2010 (ponto 2022 rejeitado — ver observação)"
-        tem10, temk = pd.notna(r["km_2022_2010"]), pd.notna(r["km_2022_kelvins"])
+            return "Usado IBGE 2010 (ponto 2022 rejeitado — evidência na observação)"
         if r["status_coord"] == "A conferir":
             return "Mantido IBGE 2022, a conferir (ver observação)"
         if r["divergencia_moderada"]:
-            return "Mantido IBGE 2022 (divergência moderada anotada)"
-        if tem10 and temk and r["km_2022_kelvins"] > LIMIAR_AUDITORIA_KM and r["km_2022_2010"] <= LIMIAR_AUDITORIA_KM:
-            return f"Mantido IBGE 2022 (IBGE 2010 a {br_num(r['km_2022_2010'])} km confirma; base independente diverge)"
-        if tem10 and temk and r["km_2022_2010"] > LIMIAR_AUDITORIA_KM and r["km_2022_kelvins"] <= LIMIAR_AUDITORIA_KM:
-            return (f"Mantido IBGE 2022 (base independente a {br_num(r['km_2022_kelvins'])} km confirma; "
-                    "ponto 2010 desatualizado)")
-        if tem10 and temk and min(r["km_2022_2010"], r["km_2022_kelvins"]) > LIMIAR_AUDITORIA_KM:
-            return "Mantido IBGE 2022 (capital: divergência dentro do limiar de 10 km para áreas urbanas extensas)"
-        if not tem10 or not temk:
+            return (f"Mantido IBGE 2022, divergência anotada (IBGE 2010 a {br_num(d10)} km e base independente a "
+                    f"{br_num(dk)} km; entre si {br_num(d10k)} km)")
+        if pd.isna(d10) or pd.isna(dk):
             return "Mantido IBGE 2022 (uma das referências não existe)"
-        return "Mantido IBGE 2022"
+        if d10 < perto and dk > LIMIAR_AUDITORIA_KM:
+            return f"Mantido IBGE 2022 (IBGE 2010 a {br_num(d10)} km confirma; base independente a {br_num(dk)} km diverge)"
+        if dk < perto and d10 > LIMIAR_AUDITORIA_KM:
+            return (f"Mantido IBGE 2022 (base independente a {br_num(dk)} km confirma; IBGE 2010 a {br_num(d10)} km, "
+                    "ponto antigo)")
+        if d10 <= LIMIAR_AUDITORIA_KM and dk <= LIMIAR_AUDITORIA_KM and d10k > LIMIAR_AUDITORIA_KM:
+            return (f"Mantido IBGE 2022 (ambas as referências a ≤ {br_num(LIMIAR_AUDITORIA_KM, 0)} km; elas divergem "
+                    f"entre si {br_num(d10k)} km)")
+        if r["sede_no_limite"] != "Sim":
+            return "Mantido IBGE 2022 (ponto na borda do limite; efeito da malha simplificada)"
+        if min(d10, dk) >= perto:
+            return (f"Mantido IBGE 2022 (nenhuma referência a < {br_num(perto, 0)} km: IBGE 2010 a {br_num(d10)} km, "
+                    f"base independente a {br_num(dk)} km; não houve divergência simultânea > limiar)")
+        return (f"Mantido IBGE 2022 (IBGE 2010 a {br_num(d10)} km; base independente a {br_num(dk)} km)")
 
     aud["decisao"] = aud.apply(decisao, axis=1)
     ordem = {"Corrigida - a conferir": 0, "A conferir": 1, "Corrigida": 2, "OK": 3}
@@ -1456,7 +1580,7 @@ def main(argv=None) -> int:
         for c in t.columns:
             if t[c].dtype == object:
                 ruins += int(t[c].astype(str).str.contains("[¿�\x00-\x08\x0b\x0c\x0e-\x1f]", regex=True).sum())
-    V.checar("Texto", "Células de texto com caractere corrompido ('¿', '�') ou de controle", 0, ruins)
+    V.checar("Texto", "Células de texto com caractere corrompido (U+00BF, U+FFFD) ou de controle", 0, ruins)
 
     # ---------- 7.10 Escrita do Excel ----------
     wb = Workbook()
@@ -1479,7 +1603,7 @@ def main(argv=None) -> int:
               "Região Geográfica Intermediária": W_REG, "Código Região Imediata": 12,
               "Região Geográfica Imediata": W_REG, "Latitude": 12, "Longitude": 12, "Fonte da Coordenada": 36,
               "Status da Coordenada": 22, "Capital (Sim/Não)": 10, "Qtd. Distritos": 10, "Código Distrito-Sede": 13,
-              "Distrito-Sede": 26, "Distritos": 45, "Sede dentro do Limite Municipal": 16,
+              "Nome do Distrito-Sede": 26, "Distritos": 45, "Sede dentro do Limite Municipal": 16,
               "Observação da Coordenada": 70, "Latitude Centroide": 12, "Longitude Centroide": 12,
               "Centroide dentro do Município": 13, "Latitude Ponto Interno": 12, "Longitude Ponto Interno": 12}
     fmt_m = {c: FMT_INT for c in ("Código IBGE", "Código IBGE (6 dígitos)", "Código UF", "Código Região Intermediária",
@@ -1493,8 +1617,9 @@ def main(argv=None) -> int:
         "Código IBGE (6 dígitos)": "Código sem o dígito verificador (padrão DATASUS/SIH/SIM).",
         "Município - UF": "Rótulo único para filtros e mapas: há nomes de município repetidos em UFs diferentes.",
         "Distritos": "Todos os distritos do município (DTB 2025), em ordem de código; o distrito-sede (sufixo 05) vem primeiro.",
-        "Código Distrito-Sede": "Distrito de sufixo 05 (convenção IBGE). Vazio em São Paulo/SP, cujos 96 distritos são "
-                                "numerados 01–96 e não têm sede codificada. Coluna anulável: leia como inteiro anulável (Int64).",
+        "Código Distrito-Sede": f"Distrito de sufixo 05 (convenção IBGE). Vazio em {txt_sem_sede}, sem sede codificada. "
+                                "Coluna anulável: leia como inteiro anulável (Int64).",
+        "Nome do Distrito-Sede": "Nome do distrito-sede (DTB 2025). Pode diferir do nome do município após renomeações.",
         "Latitude": "Latitude (graus decimais, SIRGAS 2000) do ponto oficial da SEDE MUNICIPAL (IBGE). Ver 'Fonte da Coordenada'.",
         "Longitude": "Longitude (graus decimais, SIRGAS 2000) do ponto oficial da SEDE MUNICIPAL (IBGE).",
         "Status da Coordenada": "OK = ponto IBGE 2022 mantido. Corrigida = ponto 2022 trocado pelo IBGE 2010 (evidência na "
@@ -1518,7 +1643,7 @@ def main(argv=None) -> int:
     com_d = {
         "Código Distrito": "Código IBGE do distrito (9 dígitos) = código do município (7) + sufixo (2).",
         "Código IBGE": "Código IBGE do MUNICÍPIO (7 dígitos) — chave para a aba Municipios.",
-        "Distrito-Sede": "Sim = distrito-sede (sufixo 05). 'Não se aplica' = São Paulo/SP (distritos 01–96, sem sede codificada).",
+        "Distrito-Sede": f"Sim = distrito-sede (sufixo 05). 'Não se aplica' = {txt_sem_sede}.",
         "Latitude Município": "Coordenada da sede municipal (mesma da aba Municipios).",
         "Latitude Distrito": "Coordenada da sede do distrito (ponto IBGE 'Vila' ou localidade homônima). No distrito-sede = "
                              "sede municipal. Vazio quando não há ponto oficial (motivo na coluna Observação).",
@@ -1567,7 +1692,7 @@ def main(argv=None) -> int:
     tab = Table(displayName="tbl_Resumo_UF", ref=f"A1:I{ult}")
     tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
     ws_res.add_table(tab)
-    for j, w in enumerate([8, 22, 14, 12, 11, 12, 14, 14, 13], start=1):
+    for j, w in enumerate([8, 22, 14, 12, 11, 12, 14, 14, 16], start=1):
         ws_res.column_dimensions[get_column_letter(j)].width = w
         c = ws_res.cell(row=1, column=j)
         c.font = FONTE_CAB
@@ -1634,31 +1759,39 @@ def main(argv=None) -> int:
     escrever_tabela(ws_fon, fontes_df, "tbl_Fontes",
                     {"Chave": 16, "Produto": 60, "Safra / Data-base": 30, "Uso no pipeline": 50,
                      "Origem do arquivo usado": 60, "Endereço oficial (IBGE)": 60, "Arquivo": 45, "SHA-256": 66}, {})
+    c_url = list(fontes_df.columns).index("Endereço oficial (IBGE)") + 1
     for row in ws_fon.iter_rows(min_row=2):
         for c in row:
             c.alignment = Alignment(wrap_text=True, vertical="top")
+            if c.column == c_url and isinstance(c.value, str) and c.value.startswith("http"):
+                c.hyperlink = c.value
+                c.font = Font(name="Arial", size=10, color="0563C1", underline="single")
 
     # LEIA-ME — todos os números vêm dos dados
     n_corr = int((s["fonte_chave"] == "2010").sum())
-    n_conf = int(s["status_coord"].str.contains("conferir").sum())
+    corr_conf = s.loc[s["status_coord"] == "Corrigida - a conferir", "municipio"].tolist()
+    so_conf = s.loc[s["status_coord"] == "A conferir", ["municipio", "uf"]].agg("/".join, axis=1).tolist()
     rej = s[(s["fonte_chave"] == "2010") & s["km_2022_2010"].notna()]
     maior = rej.loc[rej["km_2022_2010"].idxmax()] if len(rej) else None
     exemplo = (f" (ex.: {maior['municipio']}/{maior['uf']}, cujo ponto 2022 estava {br_num(maior['km_2022_2010'], 0)} km "
                "deslocado)") if maior is not None else ""
     sp_dist = int((dist["cod_mun"].isin(sem_sede_codificada)).sum())
     cov_d = int(dist["lat"].notna().sum())
-    bloco_motivos = "; ".join(f"{br_int(n)} — {m.lower()}" for m, n in motivos.most_common())
+    bloco_motivos = " · ".join(f"{br_int(n)}: {m[:1].lower() + m[1:]}" for m, n in motivos.most_common())
     n_mod = int(mod.sum())
     n_div = n_aud_div
-    nomes_txt = "; ".join(f"'{a}' → '{b}'" for a, b in nomes_corrigidos.items())
     txt_sp = ""
     if "3550308" in CURADORIA and "ref" in CURADORIA["3550308"]:
         i_sp = s.index[s["cod_mun"] == "3550308"][0]
         d_sp = float(haversine_km(s.at[i_sp, "lat"], s.at[i_sp, "lon"], *CURADORIA["3550308"]["ref"][:2]))
         txt_sp = f" (ex.: em São Paulo o ponto fica a {br_num(d_sp)} km da Praça da Sé)"
     ex_rej = next((r for r in rejeitados if r[2] == "vila2022"), None)
-    txt_rej = (f" Isso reprovou {len(rejeitados)} ponto(s) — p.ex. a Vila 2022 de {ex_rej[1]} "
-               f"({br_num(ex_rej[3], 4)}; {br_num(ex_rej[4], 4)}), que caía fora do município." if ex_rej else "")
+    n_r = len(rejeitados)
+    txt_rej = (f" Isso reprovou {n_r} {'ponto' if n_r == 1 else 'pontos'} — p.ex. a Vila 2022 de {ex_rej[1]} "
+               f"{br_coord(ex_rej[3], ex_rej[4])}, que caía fora do município." if ex_rej else "")
+    n_reg_corr = int(sum(dtb_bruto[c].str.contains("\u00bf", regex=False).groupby(dtb_bruto[k]).any().sum()
+                         for c, k in (("nome_rgi", "cod_rgi"), ("nome_rgint", "cod_rgint"))))
+    nomes_txt = "; ".join(f"'{a.replace(chr(0xBF), '[U+00BF]')}' → '{b}'" for a, b in nomes_corrigidos.items())
     cur_capitais = [nome_mun[c] for c in CURADORIA if eh_capital.get(c)]
     texto = [
         ("Municípios do Brasil — IBGE", None, "titulo"),
@@ -1675,9 +1808,10 @@ def main(argv=None) -> int:
         ("Regioes_Imediatas / Regioes_Intermediarias / UFs", "Dimensões para modelo estrela (Power BI).", "normal"),
         ("Resumo_UF", "Contagens por UF com fórmulas vivas (COUNTIF/COUNTIFS/SUM).", "normal"),
         ("Auditoria_Coordenadas", f"{br_int(len(tab_aud))} municípios: {br_int(n_div)} com divergência > "
-                                  f"{br_num(LIMIAR_AUDITORIA_KM, 0)} km entre fontes, {br_int(n_mod)} com divergência moderada "
-                                  "(3-5 km) e os demais por status ≠ OK, sede na borda do limite, sede junto à de outro "
-                                  "distrito ou curadoria — com os valores de cada fonte e a decisão.", "normal"),
+                                  f"{br_num(LIMIAR_AUDITORIA_KM, 0)} km entre fontes, {br_int(n_mod)} com o ponto 2022 a ≥ 3 km "
+                                  "das duas referências e os demais por status ≠ OK, precisão de minuto, sede na borda do "
+                                  "limite, sede junto à de outro distrito ou curadoria — com os valores de cada fonte e a "
+                                  "decisão.", "normal"),
         ("Validacao", f"{len(V.resultados)} checagens automáticas do pipeline + {len(formulas)} checagens com fórmula viva.", "normal"),
         ("Fontes", "Produto IBGE, safra, origem do arquivo, endereço oficial e SHA-256 de cada insumo.", "normal"),
         ("", "", "normal"),
@@ -1693,8 +1827,12 @@ def main(argv=None) -> int:
                               "DUAS fontes independentes ao mesmo tempo (IBGE 2010 e a base comunitária kelvins). A "
                               "observação registra a evidência: o ponto 2022 coincide com outra localidade (povoado, vila) "
                               "ou está isolado. Também usa o 2010 quando o ponto 2022 foi arredondado ao minuto de arco. "
-                              f"Resultado: {n_corr} municípios corrigidos{exemplo}; {n_conf} seguem marcados 'a conferir'. "
-                              f"{n_mod} pontos com divergência moderada (3-5 km) foram mantidos e anotados.", "normal"),
+                              f"Resultado: {n_corr} municípios corrigidos{exemplo}"
+                              + (f", dos quais {len(corr_conf)} ainda 'a conferir' ({', '.join(corr_conf)})" if corr_conf else "")
+                              + "." + (f" Além disso, {', '.join(so_conf)} manteve o ponto 2022 e está marcado 'a conferir'."
+                                       if so_conf else "")
+                              + f" {n_mod} pontos 2022 mantidos a ≥ 3 km das duas referências (que concordam entre si) "
+                                "estão anotados na observação.", "normal"),
         ("Curadoria", f"{len(CURADORIA)} municípios têm nota de curadoria documentada (status e/ou referência externa, com a "
                       "distância calculada pelo pipeline); a coordenada continua sendo um ponto oficial do IBGE. "
                       f"Inclui as capitais: {', '.join(cur_capitais)}.", "normal"),
@@ -1724,8 +1862,9 @@ def main(argv=None) -> int:
                                    "na coluna Observação de cada linha.", "normal"),
         ("", "", "normal"),
         ("NOMES OFICIAIS", "", "secao"),
-        ("Correção de codificação", f"O IBGE publica {len(nomes_corrigidos)} nomes de regiões com '¿' no lugar do travessão "
-                                    f"(defeito replicado pela API). Normalizados para ' - ': {nomes_txt}.", "normal"),
+        ("Correção de codificação", f"O IBGE publica {n_reg_corr} regiões ({len(nomes_corrigidos)} nomes distintos) com o "
+                                    "caractere U+00BF (ponto de interrogação invertido) no lugar do travessão — defeito "
+                                    f"replicado pela API. Normalizados para ' - ': {nomes_txt}.", "normal"),
         ("Grafias das regiões", "Os nomes das regiões seguem a grafia oficial da DTB, que às vezes difere da grafia atual do "
                                 "município homônimo (ex.: 'Juíz de Fora', 'Açu', 'Itapagé'). Relacione sempre por código.", "normal"),
         ("Dígito verificador", f"{len(dv_excecoes)} códigos oficiais não satisfazem o algoritmo do DV ({dv_txt}). São válidos.", "normal"),
@@ -1741,9 +1880,12 @@ def main(argv=None) -> int:
         ("Como atualizar", "Baixe as novas edições oficiais do IBGE (DTB, Localidades, Malha Municipal — endereços na aba Fontes), "
                            "substitua os arquivos no diretório de fontes e rode: python build_municipios_ibge.py --fontes <dir> "
                            "--saida <dir>. Se qualquer validação crítica falhar, o resultado vai para "
-                           f"{ARQUIVO_FALHA} e o arquivo anterior não é sobrescrito.", "normal"),
+                           f"{ARQUIVO_FALHA} (log em {LOG_FALHA}) e o arquivo anterior não é sobrescrito. Para pandas, "
+                           "leia a aba Resumo_UF com nrows=27 (a linha de total fica abaixo da tabela).", "normal"),
     ]
     escrever_texto(ws_leia, texto)
+    ws_leia.merge_cells("A1:B1")
+    ws_leia.row_dimensions[1].height = 28
     wb.active = wb.sheetnames.index("Municipios")
     for w in wb.worksheets:
         w.sheet_view.tabSelected = (w.title == "Municipios")
@@ -1767,13 +1909,18 @@ def main(argv=None) -> int:
         os.replace(tmp, destino)
         for f in falhas:
             log.error("VALIDAÇÃO CRÍTICA FALHOU: %s — %s (esperado %s, obtido %s)", f[0], f[1], f[2], f[3])
-        log.error("Arquivo de diagnóstico: %s (o entregável anterior foi preservado)", destino)
+        log.error("Arquivo de diagnóstico: %s (o entregável anterior e seu build_log.txt foram preservados)", destino)
+        finalizar_log(args.saida, sucesso=False)
         return 1
     destino = args.saida / ARQUIVO_SAIDA
     os.replace(tmp, destino)
+    for velho in (args.saida / ARQUIVO_FALHA, args.saida / LOG_FALHA):
+        if velho.exists():
+            velho.unlink()  # diagnóstico de uma execução anterior com falha, agora obsoleto
     log.info("Excel salvo: %s", destino)
     log.info("Build concluído sem falhas críticas (%d checagens + %d fórmulas de validação).",
              len(V.resultados), len(formulas))
+    finalizar_log(args.saida, sucesso=True)
     return 0
 
 
